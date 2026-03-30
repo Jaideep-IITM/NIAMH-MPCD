@@ -37,6 +37,9 @@ NoIsy Algorithm for Mesoscale Hydrodynamics (NIAMH; pronounced 'neev')
 #define _GNU_SOURCE // required for fenv
 # include<fenv.h>
 # include<signal.h>
+#ifdef _OPENMP
+# include<omp.h>
+#endif
 /* ****************************************** */
 /* ****************************************** */
 /* ****************************************** */
@@ -139,6 +142,11 @@ int main(int argc, char* argv[]) {
 	/* ****************************************** */
 	#ifdef DBG
 		if( DBUG > DBGRUN ) printf( "\nBegin NAIMH-MPCD\n" );
+	#endif
+	#ifdef _OPENMP
+		printf( "OpenMP enabled: using %d thread(s)\n", omp_get_max_threads() );
+	#else
+		printf( "OpenMP not enabled: running in serial mode\n" );
 	#endif
 	/* ****************************************** */
 	/* ****************************************** */

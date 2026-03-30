@@ -17,6 +17,10 @@
 # include<stdio.h>
 # include<stdlib.h>
 
+#ifdef _OPENMP
+# include<omp.h>
+#endif
+
 # include "../headers/definitions.h"
 # include "../headers/globals.h"
 # include "../headers/SRDclss.h"
@@ -65,7 +69,7 @@ void localPROP( cell ***CL,spec *SP,specSwimmer specS,int RTECH,int LC ) {
 	int a,b,c,d,id;
 	int i;
 	double V[_3D],Q[_3D];
-	double **S,eigval[_3D];
+	// S and eigval now allocated per-thread inside parallel region
 	double mass;
 	particleMPC *pMPC;	//Temporary pointer to MPCD particles
 	particleMD *pMD;	//Temporary pointer to MD particles
@@ -76,9 +80,9 @@ void localPROP( cell ***CL,spec *SP,specSwimmer specS,int RTECH,int LC ) {
 
 	// Zero
 	for( d=0; d<_3D; d++ ) V[d] = 0.0;
-	for( d=0; d<_3D; d++ ) eigval[d] = 0.0;
 
 	// Loop over all cells
+	#pragma omp parallel for collapse(3) private(a,b,c,d,id,mass,pMPC,pMD,pSW,V,Q)
 	for( a=0; a<XYZ_P1[0]; a++ ) for( b=0; b<XYZ_P1[1]; b++ ) for( c=0; c<XYZ_P1[2]; c++ ) {
 		// Idea here is to compute POP, MASS, and VCM
 		//	CM is only computed if needed
@@ -159,7 +163,7 @@ void localPROP( cell ***CL,spec *SP,specSwimmer specS,int RTECH,int LC ) {
 			}
 		}
 		// Make sums into averages
-		if( CL[a][b][c].MASS>0.0 ) for( d=0; d<DIM; d++ ){ 
+		if( CL[a][b][c].MASS>0.0 ) for( d=0; d<DIM; d++ ){
 			CL[a][b][c].VCM[d] /= CL[a][b][c].MASS;
 			if (computeCM) CL[a][b][c].CM[d] /= CL[a][b][c].MASS;
 		}
@@ -168,26 +172,41 @@ void localPROP( cell ***CL,spec *SP,specSwimmer specS,int RTECH,int LC ) {
 	//Calculate moment of inertia
 	if( RTECH==RAT || LC!=ISOF ) {
 		// moment of inertia to be about the CM of cell
+		#pragma omp parallel for collapse(3)
 		for( a=0; a<XYZ_P1[0]; a++ ) for( b=0; b<XYZ_P1[1]; b++ ) for( c=0; c<XYZ_P1[2]; c++ ) {
 			localMomInertiaTensor( &CL[a][b][c],SP,specS );
 		}
 	}
 	// Find the order parameter tensor, the director and the scalar order parameter
 	if( LC!=ISOF || RTECH==CHATE || RTECH==CHATE_MPCAT || RTECH==CHATE_LANG || RTECH==DIPOLE_VCM || RTECH==DIPOLE_DIR_SUM || RTECH==DIPOLE_DIR_AV ) {
-		//Allocate memory for S
-		S = calloc ( DIM, sizeof( *S ) );
-		for( i=0; i<DIM; i++ ) S[i] = calloc ( DIM, sizeof( *S[i] ) );
-		for( i=0; i<DIM; i++ ) for( d=0; d<DIM; d++ ) S[i][d] = 0.0;
+		// Pre-allocate per-thread S matrices to avoid malloc/free inside parallel loop
+		int nthreads = 1;
+		#ifdef _OPENMP
+		nthreads = omp_get_max_threads();
+		#endif
+		double ***S_per_thread = calloc( nthreads, sizeof(double**) );
+		double (*eigval_per_thread)[_3D] = calloc( nthreads, sizeof(double[_3D]) );
+		for( i=0; i<nthreads; i++ ) {
+			S_per_thread[i] = calloc( DIM, sizeof(double*) );
+			for( d=0; d<DIM; d++ ) S_per_thread[i][d] = calloc( DIM, sizeof(double) );
+		}
 		// Find the order parameter tensor, the director and the scalar order parameter for each cell
+		#pragma omp parallel for collapse(3) private(d,i)
 		for( a=0; a<XYZ_P1[0]; a++ ) for( b=0; b<XYZ_P1[1]; b++ ) for( c=0; c<XYZ_P1[2]; c++ ) {
 			if( CL[a][b][c].POPSRD > 1 ) {
+				int tid = 0;
+				#ifdef _OPENMP
+				tid = omp_get_thread_num();
+				#endif
+				double **S_local = S_per_thread[tid];
+				double *eigval_local = eigval_per_thread[tid];
 				// Find the tensor order parameter
-				tensOrderParam( &CL[a][b][c],S,LC );				// From the tensor order parameter find eigenvalues and vectors --- S is written over as normalized eigenvectors
-				solveEigensystem( S,DIM,eigval );
+				tensOrderParam( &CL[a][b][c],S_local,LC );				// From the tensor order parameter find eigenvalues and vectors --- S is written over as normalized eigenvectors
+				solveEigensystem( S_local,DIM,eigval_local );
 				//The scalar order parameter is the largest eigenvalue which is given first, ie eigval[0]
 				// But can be better approximated (cuz fluctuates about zero) by -2* either of the negative ones (or the average)
-				if(DIM==_3D) CL[a][b][c].S = -1.*(eigval[1]+eigval[2]);
-				else CL[a][b][c].S=eigval[0];
+				if(DIM==_3D) CL[a][b][c].S = -1.*(eigval_local[1]+eigval_local[2]);
+				else CL[a][b][c].S=eigval_local[0];
 
 				if( CL[a][b][c].S<1./(1.-DIM) ){
 					#ifdef DBG
@@ -195,21 +214,26 @@ void localPROP( cell ***CL,spec *SP,specSwimmer specS,int RTECH,int LC ) {
 						printf("Warning: Local scalar order parameter < 1/(1-DIM)\n");
 						printf("Cell [%d,%d,%d]\n",a,b,c);
 						printf("Eigenvalues=");
-						pvec(eigval,DIM);
+						pvec(eigval_local,DIM);
 						printf("Eigenvectors=");
-						for( d=0; d<DIM; d++ ) pvec(S[d],DIM);
+						for( d=0; d<DIM; d++ ) pvec(S_local[d],DIM);
 					}
 					#endif
 				}
 
 				// The director is the eigenvector corresponding to the largest eigenvalue
-				for( i=0; i<DIM; i++ ) CL[a][b][c].DIR[i] = S[0][i];
+				for( i=0; i<DIM; i++ ) CL[a][b][c].DIR[i] = S_local[0][i];
 				if( CL[a][b][c].S>1.0 ) CL[a][b][c].S=1.0;
 			}
 			//Else just leave as the old value
 		}
-		for( i=0; i<DIM; i++ ) free( S[i] );
-		free( S );
+		// Free per-thread S matrices
+		for( i=0; i<nthreads; i++ ) {
+			for( d=0; d<DIM; d++ ) free( S_per_thread[i][d] );
+			free( S_per_thread[i] );
+		}
+		free( S_per_thread );
+		free( eigval_per_thread );
 	}
 	// Find the velocity gradient tensor
 	if( LC!=ISOF ) localVelGrad( CL );
@@ -679,6 +703,7 @@ void acc_P( particleMPC *p,double t,double GRAV[] ) {
 ///
 void stream_all( particleMPC *pp,double t ) {
 	int i;
+	#pragma omp parallel for schedule(static)
 	for( i=0; i<GPOP; i++ ){
 		//Update coordinates --- check if it already streamed
 		if( (pp+i)->S_flag ) stream_P( (pp+i),t );
@@ -696,6 +721,7 @@ void stream_all( particleMPC *pp,double t ) {
 ///
 void acc_all( particleMPC *pp,double t,double GRAV[] ) {
 	int i;
+	#pragma omp parallel for schedule(static)
 	for( i=0; i<GPOP; i++ ) acc_P( (pp+i),t,GRAV );
 }
 
@@ -725,6 +751,7 @@ void gridShift_all( double SHIFT[],int shiftBack,particleMPC *SRDparticles,bc WA
 	else for( j=0; j<DIM; j++ ) signedSHIFT[j] = SHIFT[j];
 
 	//Shift each particle
+	#pragma omp parallel for schedule(static) private(j)
 	for( i=0; i<GPOP; i++ ) for( j=0; j<DIM; j++ ){
 		 SRDparticles[i].Q[j] += signedSHIFT[j]; // perform the shift
 		 // The Gallilean shift can (sometimes) force particles outside the boundaries of the system.
@@ -4624,6 +4651,7 @@ void timestep(cell ***CL, particleMPC *SRDparticles, spec SP[], bc WALL[], simpt
 	/* ******************************************************/
 	//For now only one specie is supported
 	if (in.LC == BCT) {
+		#pragma omp parallel for schedule(static) private(j)
 		for (int i = 0; i < GPOP; i++) {
 			for( j=0; j<DIM; j++ ) {
 				(SRDparticles+i)->V[j] -= (SRDparticles+i)->U[j]*((SP+0)->BS);
@@ -4688,6 +4716,7 @@ void timestep(cell ***CL, particleMPC *SRDparticles, spec SP[], bc WALL[], simpt
 		#ifdef DBG
 			if( DBUG >= DBGTITLE ) printf( "Orientation Collision Step.\n" );
 		#endif
+		#pragma omp parallel for collapse(3) schedule(dynamic) private(zeroMFPot)
 		for( i=0; i<XYZ_P1[0]; i++ ) for( j=0; j<XYZ_P1[1]; j++ ) for( k=0; k<XYZ_P1[2]; k++ ) {
             if (in.MFPLAYERH > 0) { // if MFPLAYERH set then perform the "active layer" hack
                 // Active layer
@@ -4710,6 +4739,7 @@ void timestep(cell ***CL, particleMPC *SRDparticles, spec SP[], bc WALL[], simpt
 		#ifdef DBG
 			if( DBUG >= DBGTITLE ) printf( "Orientation Shear Alignment.\n" );
 		#endif
+		#pragma omp parallel for collapse(3) schedule(dynamic)
 		for( i=0; i<XYZ_P1[0]; i++ ) for( j=0; j<XYZ_P1[1]; j++ ) for( k=0; k<XYZ_P1[2]; k++ ) {
 			//Coupling shear to orientation
 			if( CL[i][j][k].POPSRD > 1 ) jefferysTorque( &CL[i][j][k],SP,in.dt );
@@ -4741,30 +4771,51 @@ void timestep(cell ***CL, particleMPC *SRDparticles, spec SP[], bc WALL[], simpt
     for (i = 0; i < NSPECI; i++) { // Temporarily store the intended activity for each species
         savedAct[i] = (double)(SP+i)->ACT;
     }
-	for( i=0; i<XYZ_P1[0]; i++ ) for( j=0; j<XYZ_P1[1]; j++ ) for( k=0; k<XYZ_P1[2]; k++ ) {
-		//MPC/SRD collision algorithm (no collision if only 1 particle in cell)
-		CLQ[0]=i+0.5;
-		CLQ[1]=j+0.5;
-		CLQ[2]=k+0.5;
-
-        // handle active layer logic
-        if (in.MFPLAYERH > 0) {
-            for (l = 0; l < NSPECI; l++) { // if not inside a layer, set activity to 0
+    if (in.MFPLAYERH > 0) {
+        // Active layer: SP->ACT depends on j, so iterate j serially to avoid data race on SP
+        for( j=0; j<XYZ_P1[1]; j++ ) {
+            for (l = 0; l < NSPECI; l++) {
                 if (j <= in.MFPLAYERH) (SP+l)->ACT = savedAct[l];
                 else (SP+l)->ACT = 0.0;
             }
+            #pragma omp parallel for collapse(2) schedule(dynamic) private(CLQ)
+            for( i=0; i<XYZ_P1[0]; i++ ) for( k=0; k<XYZ_P1[2]; k++ ) {
+                CLQ[0]=i+0.5;
+                CLQ[1]=j+0.5;
+                CLQ[2]=k+0.5;
+                if( CL[i][j][k].POP > 1 ) MPCcollision(&CL[i][j][k], SP, *SS, in.KBT, in.RTECH, in.C, in.S, in.FRICCO, in.dt, MD_mode, in.LC, in.TAU, CLQ, outPressure );
+            }
         }
-
-        if( CL[i][j][k].POP > 1 ) MPCcollision(&CL[i][j][k], SP, *SS, in.KBT, in.RTECH, in.C, in.S, in.FRICCO, in.dt, MD_mode, in.LC, in.TAU, CLQ, outPressure );
-	}
+    } else {
+        // No active layer: all cells independent, full collapse
+        #pragma omp parallel for collapse(3) schedule(dynamic) private(CLQ)
+        for( i=0; i<XYZ_P1[0]; i++ ) for( j=0; j<XYZ_P1[1]; j++ ) for( k=0; k<XYZ_P1[2]; k++ ) {
+            CLQ[0]=i+0.5;
+            CLQ[1]=j+0.5;
+            CLQ[2]=k+0.5;
+            if( CL[i][j][k].POP > 1 ) MPCcollision(&CL[i][j][k], SP, *SS, in.KBT, in.RTECH, in.C, in.S, in.FRICCO, in.dt, MD_mode, in.LC, in.TAU, CLQ, outPressure );
+        }
+    }
 
 	// Apply the multiphase interactions
 	if( in.MULTIPHASE != MPHOFF && NSPECI>1 ) {
-		for( i=0; i<XYZ_P1[0]; i++ ) for( j=0; j<XYZ_P1[1]; j++ ) for( k=0; k<XYZ_P1[2]; k++ ) if( CL[i][j][k].POP > 1 ) multiphaseColl(&CL[i][j][k], SP, *SS, in.MULTIPHASE, in.KBT, MD_mode, CLQ, outPressure );
+		#pragma omp parallel for collapse(3) schedule(dynamic) private(CLQ)
+		for( i=0; i<XYZ_P1[0]; i++ ) for( j=0; j<XYZ_P1[1]; j++ ) for( k=0; k<XYZ_P1[2]; k++ ) {
+			if( CL[i][j][k].POP > 1 ) {
+				CLQ[0]=i+0.5; CLQ[1]=j+0.5; CLQ[2]=k+0.5;
+				multiphaseColl(&CL[i][j][k], SP, *SS, in.MULTIPHASE, in.KBT, MD_mode, CLQ, outPressure );
+			}
+		}
 	}
 	// Apply the incompressibility correction
 	if( in.inCOMP != INCOMPOFF ) {
-		for( i=0; i<XYZ_P1[0]; i++ ) for( j=0; j<XYZ_P1[1]; j++ ) for( k=0; k<XYZ_P1[2]; k++ ) if( CL[i][j][k].POP > 1 ) incompColl(&CL[i][j][k], SP, *SS, in.inCOMP, MD_mode, CLQ, outPressure );
+		#pragma omp parallel for collapse(3) schedule(dynamic) private(CLQ)
+		for( i=0; i<XYZ_P1[0]; i++ ) for( j=0; j<XYZ_P1[1]; j++ ) for( k=0; k<XYZ_P1[2]; k++ ) {
+			if( CL[i][j][k].POP > 1 ) {
+				CLQ[0]=i+0.5; CLQ[1]=j+0.5; CLQ[2]=k+0.5;
+				incompColl(&CL[i][j][k], SP, *SS, in.inCOMP, MD_mode, CLQ, outPressure );
+			}
+		}
 	}
 
     for (i = 0; i < NSPECI; i++) { // revert activity
@@ -4826,6 +4877,7 @@ void timestep(cell ***CL, particleMPC *SRDparticles, spec SP[], bc WALL[], simpt
 	/* * ADDING ORIENTATION PART TO THE VELOCITY */
 	/* *******************************************/
 	if (in.LC == BCT) {
+		#pragma omp parallel for schedule(static) private(j)
 		for (int i = 0; i < GPOP; i++) {
 			for( j=0; j<DIM; j++ ) {
 				(SRDparticles+i)->V[j] += (SRDparticles+i)->U[j]*((SP+0)->BS);

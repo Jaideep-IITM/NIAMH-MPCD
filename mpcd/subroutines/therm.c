@@ -211,6 +211,7 @@ double TEMP( particleMPC *pp,spec SP[],bc WALL[],double VEL[] ) {
 	double temp = 0.;
 	int i,j,k,c = 0;
 	//Fluid particleMPC contribution
+	#pragma omp parallel for schedule(static) reduction(+:KBT) private(temp)
 	for( i=0; i<GPOP; i++ ) {
 		temp = ((pp+i)->V[0]-VEL[0])*((pp+i)->V[0]-VEL[0]);
 		temp += ((pp+i)->V[1]-VEL[1])*((pp+i)->V[1]-VEL[1]);
@@ -360,10 +361,17 @@ double calcE_LC( cell ***CL,int LC,spec *pSP ) {
 /// @param AVVEL Return pointer for the average global velocity.
 ///
 void avVel( cell ***CL,double AVVEL[] ) {
-	int a,b,c,d;
-	for( d=0; d<DIM; d++ ) AVVEL[d]=0.;
-	for( a=0; a<XYZ_P1[0]; a++ ) for( b=0; b<XYZ_P1[1]; b++ ) for( c=0; c<XYZ_P1[2]; c++ ) for( d=0; d<DIM; d++ ) AVVEL[d] += CL[a][b][c].VCM[d];
-	for( d=0; d<DIM; d++ ) AVVEL[d] /= VOL;
+	int a,b,c;
+	double sum0=0., sum1=0., sum2=0.;
+	#pragma omp parallel for collapse(3) reduction(+:sum0,sum1,sum2)
+	for( a=0; a<XYZ_P1[0]; a++ ) for( b=0; b<XYZ_P1[1]; b++ ) for( c=0; c<XYZ_P1[2]; c++ ) {
+		sum0 += CL[a][b][c].VCM[0];
+		if( DIM >= 2 ) sum1 += CL[a][b][c].VCM[1];
+		if( DIM >= 3 ) sum2 += CL[a][b][c].VCM[2];
+	}
+	AVVEL[0] = sum0 / VOL;
+	if( DIM >= 2 ) AVVEL[1] = sum1 / VOL;
+	if( DIM >= 3 ) AVVEL[2] = sum2 / VOL;
 }
 
 ///

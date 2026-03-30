@@ -888,6 +888,7 @@ void magTorque( particleMPC *pMPC,spec *SP,double dt,double MAG[] ) {
 ///
 void magTorque_all( particleMPC *pp,spec *SP,double dt,double MAG[] ) {
 	int i;
+	#pragma omp parallel for schedule(static)
 	for( i=0; i<GPOP; i++ ) magTorque( (pp+i),SP,dt,MAG );
 }
 
@@ -2077,6 +2078,7 @@ void velGradD3Q15( cell ***CL ) {
 	double Tinv=3.;
 
 	//Bulk
+	#pragma omp parallel for collapse(3) private(i,j,k)
 	for( a=1; a<XYZ[0]; a++ ) for( b=1; b<XYZ[1]; b++ ) for( c=1; c<XYZ[2]; c++ ) for( i=0; i<DIM; i++ ) {
 		//D3Q15 Gradient
 		for( j=0; j<DIM; j++ ) {
@@ -2137,6 +2139,7 @@ void velGradD2Q9( cell ***CL ) {
 
 	c=0;		//There is no z
 	//Bulk
+	#pragma omp parallel for collapse(2) private(i,j,k)
 	for( a=1; a<XYZ[0]; a++ ) for( b=1; b<XYZ[1]; b++ ) for( i=0; i<DIM; i++ ) {
 		//D2Q9 Gradient
 		for( j=0; j<DIM; j++ ) {

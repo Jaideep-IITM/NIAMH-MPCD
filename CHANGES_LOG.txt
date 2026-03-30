@@ -1,0 +1,214 @@
+================================================================================
+  NIAMH-MPCD OpenMP Parallelization - Complete Change Log
+  Date: 2026-03-28
+================================================================================
+
+OVERVIEW
+--------
+Parallelized the serial NIAMH-MPCD simulation using OpenMP pragmas across
+the hottest loops in the codebase. The RNG (rand.c) and Makefile were already
+OpenMP-ready. stream_all() and acc_all() were already parallelized.
+
+
+================================================================================
+PHASE 1: Core Parallelizations (14 loops)
+================================================================================
+
+FILE: mpcd/subroutines/mpc.c
+-----------------------------
+
+1. Grid Shift Loop (gridShift_all, ~line 734)
+   - Added: #pragma omp parallel for schedule(static) private(j)
+   - Scope: SRD particle loop (GPOP iterations)
+   - Rationale: Each particle shift is independent; signedSHIFT is read-only
+
+2. localPROP Main Cell Loop (~line 86)
+   - Added: #pragma omp parallel for collapse(3) private(a,b,c,d,id,mass,pMPC,pMD,pSW,V,Q)
+   - Scope: Triple-nested loop over all cells
+   - Rationale: Each cell writes only to its own data. Linked-list traversal
+     is read-only (no structural modification to lists).
+
+3. Moment of Inertia Loop (~line 175)
+   - Added: #pragma omp parallel for collapse(3)
+   - Scope: Triple-nested cell loop calling localMomInertiaTensor
+   - Rationale: Each cell independent
+
+4. Order Parameter Tensor Loop (~line 186)
+   - Added: #pragma omp parallel for collapse(3) private(d,i)
+   - Scope: Triple-nested cell loop computing tensor order parameter
+   - Key change: Replaced shared S matrix with per-thread pre-allocated
+     S_per_thread arrays (indexed by omp_get_thread_num), avoiding
+     malloc/free inside the parallel loop. Each thread gets its own
+     S matrix and eigval array.
+
+5. LC Collision Loop (~line 4697)
+   - Added: #pragma omp parallel for collapse(3) schedule(dynamic) private(zeroMFPot)
+   - Scope: Triple-nested cell loop calling LCcollision
+   - Rationale: Each cell independent; zeroMFPot set per-iteration
+
+6. Jefferys Torque / Shear Alignment Loop (~line 4719)
+   - Added: #pragma omp parallel for collapse(3) schedule(dynamic)
+   - Scope: Triple-nested cell loop calling jefferysTorque
+
+7. Velocity Collision Loop (~line 4750) [BIGGEST PERFORMANCE WIN]
+   - Added: #pragma omp parallel for collapse(3) schedule(dynamic) private(CLQ)
+   - Scope: Triple-nested cell loop calling MPCcollision
+   - Key change: Split into two paths to handle SP->ACT data race:
+     * When MFPLAYERH == 0 (common case): full collapse(3) on i,j,k
+     * When MFPLAYERH > 0 (active layer): iterate j serially to set
+       SP->ACT, then collapse(2) on i,k
+   - CLQ array made private so each thread has its own cell position
+
+8. Multiphase Collision Loop (~line 4769)
+   - Added: #pragma omp parallel for collapse(3) schedule(dynamic) private(CLQ)
+   - Also added per-cell CLQ initialization (was stale from previous loop)
+
+9. Incompressibility Correction Loop (~line 4773)
+   - Added: #pragma omp parallel for collapse(3) schedule(dynamic) private(CLQ)
+   - Same CLQ fix as multiphase
+
+10. Orientation-Velocity Subtraction Loop (~line 4633)
+    - Added: #pragma omp parallel for schedule(static) private(j)
+    - Scope: GPOP particle loop subtracting orientation from velocity
+
+11. Orientation-Velocity Addition Loop (~line 4835)
+    - Added: #pragma omp parallel for schedule(static) private(j)
+    - Scope: GPOP particle loop adding orientation back to velocity
+
+
+FILE: mpcd/subroutines/lc.c
+----------------------------
+
+12. magTorque_all (~line 889)
+    - Added: #pragma omp parallel for schedule(static)
+    - Scope: GPOP particle loop applying magnetic torque
+
+
+FILE: mpcd/subroutines/therm.c
+-------------------------------
+
+13. TEMP Calculation (~line 214)
+    - Added: #pragma omp parallel for schedule(static) reduction(+:KBT) private(temp)
+    - Scope: GPOP particle loop computing kinetic energy sum
+    - Wall loop (NBC iterations, typically small) left serial
+
+14. Average Velocity (avVel, ~line 365)
+    - Rewrote to use 3 scalar reductions (sum0, sum1, sum2) instead of
+      array accumulation, since OpenMP C lacks native array reduction.
+    - Added: #pragma omp parallel for collapse(3) reduction(+:sum0,sum1,sum2)
+
+
+================================================================================
+PHASE 2: Optimizations & Additional Parallelizations
+================================================================================
+
+FILE: mpcd/subroutines/mpc.c
+-----------------------------
+
+15. Dynamic Scheduling for Collision Loops
+    - Changed all cell-based collision loops from default (static) scheduling
+      to schedule(dynamic). Cells with more particles take longer, so dynamic
+      scheduling balances the load across threads.
+    - Applied to: LC collision, jefferysTorque, velocity collision (both paths),
+      multiphase, incompressibility loops
+
+16. Pre-allocated Per-Thread S Matrices (Order Parameter Loop)
+    - Replaced per-iteration calloc/free of S_local with pre-allocated arrays
+      indexed by thread ID (omp_get_thread_num). Eliminates heap contention
+      from threads competing for malloc locks.
+
+
+FILE: mpcd/subroutines/lc.c
+----------------------------
+
+17. velGradD3Q15 Bulk Loop (~line 2081)
+    - Added: #pragma omp parallel for collapse(3) private(i,j,k)
+    - Scope: Bulk interior cells computing velocity gradient tensor
+    - Edge-copy loops left serial (run after bulk, depend on bulk results)
+
+18. velGradD2Q9 Bulk Loop (~line 2141)
+    - Added: #pragma omp parallel for collapse(2) private(i,j,k)
+    - Same as above for 2D simulations
+
+
+FILE: mpcd/mpcd.c
+-----------------
+
+19. Thread Count Reporting
+    - Added #include <omp.h> (guarded by #ifdef _OPENMP)
+    - Prints "OpenMP enabled: using N thread(s)" at program startup
+    - Prints "OpenMP not enabled: running in serial mode" if compiled without
+
+
+================================================================================
+PHASE 3: Pre-existing Bug Fixes (md/mdsrd.c)
+================================================================================
+
+FILE: md/mdsrd.c
+-----------------
+This file had broken OpenMP pragmas that predated our work.
+
+20. ComputeElectrostaticForcesSRD (~line 186)
+    - REMOVED broken pragma: referenced undeclared variables (rCutCoul2,
+      bjerrumkT, E, Eforce), and attached to wrong loop
+
+21. ComputeLJForcesSRD_CL (~line 955)
+    - REMOVED broken pragma: referenced undeclared nebrSTD, used wrong
+      loop variables (i instead of a,b,c)
+
+22. ComputeLJForcesSRD (two instances, ~lines 773 and 851)
+    - Fixed: changed default(none) to default(shared)
+    - Fixed: removed nebrSTD from shared clause (undeclared in function)
+    - Fixed: added j to private clause (inner loop variable)
+
+23. ComputeLJForcesSRD_Cap (~line 1166)
+    - Same fixes as #22
+
+24. ComputeElectrostaticForces (~line 1236)
+    - Fixed: changed default(none) to default(shared)
+    - Fixed: removed undeclared vars from shared clause
+    - Fixed: removed Efield from private (already shared)
+
+25. IntegrateMD velocity update (~line 492)
+    - Fixed: moved kinE/v2 zeroing BEFORE the pragma (was between pragma
+      and for loop, causing "for statement expected" error)
+    - Fixed: cleaned up private clause
+
+
+================================================================================
+INTENTIONALLY LEFT SERIAL
+================================================================================
+
+- Binning (mpc.c binin/bin): Linked-list pointer manipulation has data races
+- Scramble (mpc.c): Random particle swaps between arbitrary indices
+- BC collision (mpc.c): Writes to shared WALL[].dV/dL from multiple particles
+- Ghost particles, swimmer dipole, swimmer integration: Complex shared state
+- Edge-copy loops in velGrad functions: Depend on bulk results, very small
+
+
+================================================================================
+HOW TO USE
+================================================================================
+
+Build:
+  make clean && make
+
+Run (control thread count via OMP_NUM_THREADS):
+  OMP_NUM_THREADS=1 ./mpcd.out -i input.json -o .    # serial baseline
+  OMP_NUM_THREADS=4 ./mpcd.out -i input.json -o .    # 4 threads
+  OMP_NUM_THREADS=8 ./mpcd.out -i input.json -o .    # 8 threads
+
+Verify OpenMP is active:
+  OMP_DISPLAY_ENV=TRUE OMP_NUM_THREADS=4 ./mpcd.out -i input.json -o .
+
+The program prints thread count at startup, e.g.:
+  "OpenMP enabled: using 4 thread(s)"
+
+
+================================================================================
+FUTURE WORK
+================================================================================
+
+- Parallelize ghostPart (triple-nested cell loop, needs analysis of writes)
+- BC collision with per-wall accumulation buffers (significant restructuring)
+- Profile to identify remaining serial bottlenecks after these changes

@@ -2077,9 +2077,8 @@ void initializeSIM(cell ***CL, particleMPC *SRDparticles, spec SP[], bc WALL[], 
 	}
 	else for( j=0; j<DIM; j++ ) AVV[j]=0.0;
 
-	// initialise global variables relating to box-muller spare caching
-	BMHASSPARE = 0;
-	BMSPARE = 0.0;
+	// initialise per-thread box-muller spare caching
+	resetBMSpare();
 
 	#ifdef DBG
 		if( DBUG >= DBGINIT ) printf( "\tInitialize System\n" );

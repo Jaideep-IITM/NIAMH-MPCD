@@ -17,8 +17,8 @@ objects    = $(sources:.c=.o)
 
 # other variables
 cc         :=  gcc
-cflags     :=  -Wall -fcommon
-lib        :=  -lm
+cflags     :=  -Wall -fcommon -fopenmp
+lib        :=  -lm -fopenmp
 opt        :=  -O3
 
 #----------------------------------------------------------------------------------------------------

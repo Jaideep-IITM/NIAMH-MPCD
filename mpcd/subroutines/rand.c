@@ -15,6 +15,8 @@
 /// Base methods using the Mersenne Twister are prefixed with `MT_`, while those using xoroshiro are prefixed with `X_`.
 /// Methods with no prefix are those freely available to the user, and will call the appropriate underlying method.
 ///
+/// All RNG state is per-thread to support OpenMP parallelism.
+///
 
 # include <math.h>
 # include <sys/time.h>
@@ -22,11 +24,47 @@
 # include <unistd.h>
 # include <stdint.h>
 
+#ifdef _OPENMP
+# include <omp.h>
+#endif
+
 # include "../headers/definitions.h"
 #include "../headers/globals.h"
 # include "../headers/SRDclss.h"
 # include "../headers/mtools.h"
 # include "../headers/pout.h"
+
+/// @brief Maximum number of OpenMP threads supported for per-thread RNG state.
+#define MAX_OMP_THREADS 128
+
+/// @brief Returns the current OpenMP thread ID, or 0 if not in a parallel region.
+static inline int get_tid(void) {
+#ifdef _OPENMP
+	return omp_get_thread_num();
+#else
+	return 0;
+#endif
+}
+
+/* ****************************************** */
+/* ********** Per-thread BM state *********** */
+/* ****************************************** */
+
+/// @brief Per-thread flag for whether Box-Muller has a spare cached.
+static int BMHASSPARE_T[MAX_OMP_THREADS] = {0};
+/// @brief Per-thread cached spare value from Box-Muller.
+static double BMSPARE_T[MAX_OMP_THREADS] = {0.0};
+
+///
+/// @brief Reset Box-Muller spare cache for all threads. Called during initialisation.
+///
+void resetBMSpare(void) {
+	int t;
+	for (t = 0; t < MAX_OMP_THREADS; t++) {
+		BMHASSPARE_T[t] = 0;
+		BMSPARE_T[t] = 0.0;
+	}
+}
 
 /* ****************************************** */
 /* ****************************************** */
@@ -36,36 +74,56 @@
 /* ****************************************** */
 /* ****************************************** */
 
-/// @brief MT variable: The state vector of the RNG.
-static unsigned long mt[NN];
-/// @brief MT variable: MT counter variable. `mti==NN+1` means mt[NN] is not initialized.
-static int mti=NN+1;
+/// @brief MT variable: Per-thread state vectors of the RNG.
+static unsigned long mt[MAX_OMP_THREADS][NN];
+/// @brief MT variable: Per-thread counter variables. `mti==NN+1` means mt[NN] is not initialized.
+static int mti[MAX_OMP_THREADS];
+
+/// @brief Initialise mti values to NN+1 (uninitialised) for all threads.
+static int mti_initialized = 0;
+static void ensure_mti_init(void) {
+	if (!mti_initialized) {
+		int t;
+		for (t = 0; t < MAX_OMP_THREADS; t++) mti[t] = NN + 1;
+		mti_initialized = 1;
+	}
+}
+
+///
+/// @brief Initialize the Mersenne Twister random number generator with a given seed for a specific thread.
+///
+/// @param s The seed to use to initialise the random number generator.
+/// @param tid The thread ID to initialise.
+///
+static void MT_init_genrand_tid(unsigned long s, int tid){
+  mt[tid][0]= s & 0xffffffffUL;
+  for (mti[tid]=1; mti[tid]<NN; mti[tid]++) {
+    mt[tid][mti[tid]] =
+            (1812433253UL * (mt[tid][mti[tid]-1] ^ (mt[tid][mti[tid]-1] >> 30)) + mti[tid]);
+    mt[tid][mti[tid]] &= 0xffffffffUL;
+  }
+}
 
 ///
 /// @brief Generate a random seed, if necessary, and initialize the Mersenne Twister random number generator.
 ///
-/// Generates a random seed (if necessary), then uses this to initialise the state of the Mersenne Twister random number
-/// generator. Initialisation is near identical to the method MT_init_genrand(), but for legacy reasons does not call
-/// it explicitly.
+/// Seeds ALL threads with derived seeds (base_seed + thread_id) for independent streams.
 ///
 /// @param seed Input seed. If zero, a random seed is generated using the time in microseconds add the process id.
-/// @see MT_init_genrand()
-/// @return The seed used to initialise the random number generator. Primarily to allow the user to check what seed was generated.
+/// @return The seed used to initialise the random number generator.
 ///
 unsigned long MT_RandomSeedSRD (unsigned long seed)
 {
-  // Adapted from Fred Tessier code
-
-  // Get a seed from time+pid if seed=0
+  int t;
   struct timeval tv;
-  gettimeofday(&tv, NULL); // Get the time to use the microseconds as an "random" seed
+  gettimeofday(&tv, NULL);
   if (!seed) seed = tv.tv_usec+getpid();
 
-  // Initialize mersenne twister array
-  mt[0]= seed & 0xffffffff;
-  for (mti=1; mti<NN; mti++) {
-      mt[mti] = (1812433253UL * (mt[mti-1] ^ (mt[mti-1] >> 30)) + mti);
-      mt[mti] &= 0xffffffffUL;
+  ensure_mti_init();
+
+  // Seed all threads with different derived seeds
+  for (t = 0; t < MAX_OMP_THREADS; t++) {
+    MT_init_genrand_tid(seed + (unsigned long)t, t);
   }
 
   return (seed);
@@ -80,63 +138,48 @@ unsigned long MT_RandomSeedSRD (unsigned long seed)
 /// @see MT_RandomSeedSRD()
 ///
 void MT_init_genrand(unsigned long s){
-  // Mersenne twister
-  // http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/MT2002/CODES/mt19937ar.c.
-  // Initializes mt[NN] with a seed.
-
-  mt[0]= s & 0xffffffffUL;
-  for (mti=1; mti<NN; mti++) {
-    mt[mti] =
-            (1812433253UL * (mt[mti-1] ^ (mt[mti-1] >> 30)) + mti);
-    /* See Knuth TAOCP Vol2. 3rd Ed. P.106 for multiplier. */
-    /* In the previous versions, MSBs of the seed affect   */
-    /* only MSBs of the array mt[].                        */
-    /* 2002/01/09 modified by Makoto Matsumoto             */
-    mt[mti] &= 0xffffffffUL;
-    /* for >32 bit machines */
+  int t;
+  ensure_mti_init();
+  for (t = 0; t < MAX_OMP_THREADS; t++) {
+    MT_init_genrand_tid(s + (unsigned long)t, t);
   }
 }
 ///
 /// @brief Generates a random int32 number on the [0,0xffffffff]-interval using Mersenne Twister.
 ///
-/// This performs a twist transformation to the state vector to generate a new random number. It first performs a sanity
-/// check to see if the seed has not been properly set (indicated by the state variable `mti`), before performing the
-/// twist. It finally uses the state vector to generate a random number.
+/// This performs a twist transformation to the state vector to generate a new random number. Uses per-thread state.
 ///
 /// @return The pseudo-randomly generated number.
 ///
 unsigned long MT_genrand_int32(void){
-  // Mersenne twister
-  // http://www.math.sci.hiroshima-u.ac.jp/~m-mat/MT/MT2002/CODES/mt19937ar.c
-  // Generates a random number on [0,0xffffffff]-interval
-
+  int tid = get_tid();
   unsigned long y;
   static unsigned long mag01[2]={0x0UL, MATRIX_A};
   struct timeval tv;
 
-  /* mag01[x] = x * MATRIX_A  for x=0,1 */
-  if (mti >= NN) { /* generate NN words at one time */
+  ensure_mti_init();
+
+  if (mti[tid] >= NN) { /* generate NN words at one time */
       int kk;
 
-      if (mti == NN+1) {  /* if init_genrand() has not been called, */
-          gettimeofday(&tv, NULL); // Get the time to use the microseconds as an "random" seed
-          MT_init_genrand(tv.tv_usec);
-          //init_genrand(5489UL); /* a default initial seed is used */
+      if (mti[tid] == NN+1) {  /* if init_genrand() has not been called, */
+          gettimeofday(&tv, NULL);
+          MT_init_genrand_tid(tv.tv_usec + (unsigned long)tid, tid);
       }
       for (kk=0;kk<NN-MM;kk++) {
-          y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
-          mt[kk] = mt[kk+MM] ^ (y >> 1) ^ mag01[y & 0x1UL];
+          y = (mt[tid][kk]&UPPER_MASK)|(mt[tid][kk+1]&LOWER_MASK);
+          mt[tid][kk] = mt[tid][kk+MM] ^ (y >> 1) ^ mag01[y & 0x1UL];
       }
       for (;kk<NN-1;kk++) {
-          y = (mt[kk]&UPPER_MASK)|(mt[kk+1]&LOWER_MASK);
-          mt[kk] = mt[kk+(MM-NN)] ^ (y >> 1) ^ mag01[y & 0x1UL];
+          y = (mt[tid][kk]&UPPER_MASK)|(mt[tid][kk+1]&LOWER_MASK);
+          mt[tid][kk] = mt[tid][kk+(MM-NN)] ^ (y >> 1) ^ mag01[y & 0x1UL];
       }
-      y = (mt[NN-1]&UPPER_MASK)|(mt[0]&LOWER_MASK);
-      mt[NN-1] = mt[MM-1] ^ (y >> 1) ^ mag01[y & 0x1UL];
+      y = (mt[tid][NN-1]&UPPER_MASK)|(mt[tid][0]&LOWER_MASK);
+      mt[tid][NN-1] = mt[tid][MM-1] ^ (y >> 1) ^ mag01[y & 0x1UL];
 
-      mti = 0;
+      mti[tid] = 0;
   }
-  y = mt[mti++];
+  y = mt[tid][mti[tid]++];
   /* Tempering */
   y ^= (y >> 11);
   y ^= (y << 7) & 0x9d2c5680UL;
@@ -164,112 +207,103 @@ unsigned long MT_genrand_int32(void){
 
   See <http://creativecommons.org/publicdomain/zero/1.0/>. */
 
-/// @brief Xoroshiro variable: the state vector of the RNG.
-static unsigned long X_state[4];
-/// @brief Xoroshiro variable: flag to show whether this has been seeded or not.
-int X_seeded = 0;
+/// @brief Xoroshiro variable: per-thread state vectors of the RNG.
+static unsigned long X_state[MAX_OMP_THREADS][4];
+/// @brief Xoroshiro variable: per-thread flag to show whether this has been seeded or not.
+static int X_seeded[MAX_OMP_THREADS] = {0};
 
 ///
 /// @brief Rotates a 32-bit integer left by a given number of bits.
 ///
-/// This is a helper function for the xoshiro128++ RNG. It rotates a 32-bit integer left by a given number of bits,
-/// which is used several times in the generation method.
-///
 /// @param x The 32-bit integer to rotate.
 /// @param k The number of bits to rotate by.
-/// @return The rotated32 integer.
+/// @return The rotated 32-bit integer.
 ///
 static inline unsigned long X_rotl(const long int x, int k) {
   return (x << k) | (x >> (32 - k));
 }
 
 ///
+/// @brief Initialise the xoshiro128++ RNG with a given seed using SplitMix64 for a specific thread.
+///
+/// @param s The seed to initialise with.
+/// @param tid The thread ID to initialise.
+///
+static void X_init_genrand_tid(unsigned long s, int tid) {
+  int i;
+  unsigned long sm_state = s;
+
+  for (i = 0; i < 4; i++) {
+      unsigned long z = (sm_state += UINT64_C(0x9E3779B97F4A7C15));
+      z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+      z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
+      X_state[tid][i] = z ^ (z >> 31);
+  }
+
+  X_seeded[tid] = 1;
+}
+
+///
 /// @brief Initialise the xoshiro128++ RNG with a given seed using SplitMix64.
 ///
-/// Initialises the xoroshiro RNG. In order to do this, an instance of the SplitMix64 algorithm is initialised with the
-/// given seed. 4 usages of SplitMix64 are then applied to generate the initial state of xoroshiro from the seed.
-///
-/// This additional step is necessary because xoroshiro requires 4 pseudo-random 32-bit integers to initialise the
-/// state, rather than a single state variable (as in Mersenne Twister).
+/// Seeds ALL threads with derived seeds for independent streams.
 ///
 /// @param s The seed to initialise with.
 ///
 void X_init_genrand(unsigned long s) {
-  int i; // counting variable
-
-  /* SplitMix64 code taken from: https://github.com/svaarala/duktape/blob/master/misc/splitmix64.c
-   * Written in 2015 by Sebastiano Vigna (vigna@acm.org)
-      To the extent possible under law, the author has dedicated all copyright
-      and related and neighboring rights to this software to the public domain
-      worldwide. This software is distributed without any warranty.
-      See <http://creativecommons.org/publicdomain/zero/1.0/>. */
-
-  unsigned long sm_state = s; // splitmix64 state
-
-  for (i = 0; i < 4; i++) {
-      // generate the next value in splitmix
-      unsigned long z = (sm_state += UINT64_C(0x9E3779B97F4A7C15));
-      z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
-      z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
-
-      X_state[i] = z ^ (z >> 31); // output value from splitmix
+  int t;
+  for (t = 0; t < MAX_OMP_THREADS; t++) {
+    X_init_genrand_tid(s + (unsigned long)t, t);
   }
-
-  X_seeded = 1; // mark as seeded
 }
 
 ///
 /// @brief Performs a pre-processing step to initialise the Xoroshiro RNG.
 ///
-/// If the seed is set as 0 then a new seed is generated using the current time and process id. A safety check is then
-/// performed to ensure that xoroshiro has not been properly seeded in X_init_genrand(), and if it has not then it
-/// is initialised with the new seed.
+/// Seeds ALL threads. If the seed is set as 0 then a new seed is generated.
 ///
 /// @param seed A single 32-bit integer to use as the seed. If set as zero, a new seed is generated.
-/// @see X_init_genrand()
-/// @return The seed used to initialise the random number generator. Primarily to allow the user to check what seed was generated.
+/// @return The seed used to initialise the random number generator.
 ///
 unsigned long X_RandomSeedSRD (unsigned long seed) {
-  // Perform the same seeding as in the MT
-
+  int t;
   struct timeval tv;
-  gettimeofday(&tv, NULL); // Get the time to use the microseconds as an "random" seed
+  gettimeofday(&tv, NULL);
   if (!seed) seed = tv.tv_usec+getpid();
 
-  if (X_seeded == 0) {
-      X_init_genrand(seed);
+  // Seed all threads
+  for (t = 0; t < MAX_OMP_THREADS; t++) {
+    if (X_seeded[t] == 0) {
+      X_init_genrand_tid(seed + (unsigned long)t, t);
+    }
   }
 
   return seed;
 }
 
 ///
-/// @brief Generates a random 32-bit integer using the xoshiro128++ RNG.
-///
-/// Generates a random 32-bit integer using the xoshiro128++ RNG. This is a 32-bit RNG with a period of 2^128-1. First,
-/// it ensures the RNG has been properly initialised, and if it has not then it is initialised with a new seed. It
-/// proceeds to perform a rotation using the state, giving the next random number. The state is then updated per the
-/// algorithm, doing a bitwise <b>XO</b>R, a <b>ro</b>tation, a <b>sh</b>ift, and a <b>ro</b>tation - Hence the name
-/// Xoroshiro.
+/// @brief Generates a random 32-bit integer using the xoshiro128++ RNG. Uses per-thread state.
 ///
 /// @return A random 32-bit integer.
 ///
 unsigned long X_genrand_int32(void) {
-  if (X_seeded == 0) { // ensure seed is properly set, if not then seed with a random value
+  int tid = get_tid();
+
+  if (X_seeded[tid] == 0) {
       X_RandomSeedSRD(0);
   }
 
-  const unsigned long result = X_rotl(X_state[0] + X_state[3], 7) + X_state[0];
-  const unsigned long t = X_state[1] << 9;
+  const unsigned long result = X_rotl(X_state[tid][0] + X_state[tid][3], 7) + X_state[tid][0];
+  const unsigned long t = X_state[tid][1] << 9;
 
-  X_state[2] ^= X_state[0];
-  X_state[3] ^= X_state[1];
-  X_state[1] ^= X_state[2];
-  X_state[0] ^= X_state[3];
+  X_state[tid][2] ^= X_state[tid][0];
+  X_state[tid][3] ^= X_state[tid][1];
+  X_state[tid][1] ^= X_state[tid][2];
+  X_state[tid][0] ^= X_state[tid][3];
 
-  X_state[2] ^= t;
+  X_state[tid][2] ^= t;
 
-  X_state[3] = X_rotl(X_state[3], 11);
+  X_state[tid][3] = X_rotl(X_state[tid][3], 11);
 
   return result;
 }
@@ -284,8 +318,7 @@ unsigned long X_genrand_int32(void) {
 ///
 /// @brief Takes the input seed and checks to see if a random seed needs to be generated. Proceeds to initialise the RNG.
 ///
-/// Interface method. Takes the input seed and checks to see if a random seed needs to be generated. Proceeds to
-/// initialise the RNG.
+/// Interface method. Seeds ALL threads for parallel-safe RNG.
 ///
 /// @param seed Seed used to initialise the generators. If set to zero, a new seed is generated.
 /// @return The seed used to initialise the RNG.
@@ -466,6 +499,7 @@ void genrand_cone( double axis[],double vecOut[],double theta,int dimension ) {
 ///
 /// Uses a Box-Muller transformation to turn a uniform random number on [0,1) into a Gaussian random number. Taken from
 /// http://www.taygeta.com/random/gaussian.html.
+/// Uses per-thread spare caching for thread safety.
 ///
 /// @see genrand_real()
 /// @return The randomly generated Gaussian.
@@ -477,9 +511,10 @@ float genrand_gauss( void ) {
    StDev of 1. From
    http://www.taygeta.com/random/gaussian.html
 */
-	if (BMHASSPARE) {  // if a spare value is cached from a previous run, use it
-		BMHASSPARE = 0;
-		return BMSPARE;
+	int tid = get_tid();
+	if (BMHASSPARE_T[tid]) {  // if a spare value is cached from a previous run, use it
+		BMHASSPARE_T[tid] = 0;
+		return BMSPARE_T[tid];
 	} else {  // otherwise, repeat the BM algorithm, caching the spare
 		float x1,x2,w,y1;
 		do{
@@ -490,8 +525,8 @@ float genrand_gauss( void ) {
 		w = sqrt( (-2. * log( w )) / w );
 		y1 = x1*w;  // first generated random number
 
-		BMSPARE = x2*w;  // second generated random number
-		BMHASSPARE = 1;
+		BMSPARE_T[tid] = x2*w;  // second generated random number
+		BMHASSPARE_T[tid] = 1;
 
 		return y1;
 	}

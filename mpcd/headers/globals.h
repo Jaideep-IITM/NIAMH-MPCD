@@ -59,9 +59,4 @@ int maxXYZ;
 /// @brief The name of the input file for the MD simulation.
 char* mdInputFile;
 
-/// @brief Whether the Box-Muller transform has a spare value cached.
-int BMHASSPARE;
-/// @brief The spare value from the Box-Muller transform.
-double BMSPARE;
-
 #endif

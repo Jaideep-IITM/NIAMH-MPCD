@@ -183,15 +183,6 @@ void ComputeElectrostaticForcesSRD (simptr sim,struct particleMPC *pSRD,struct s
 	n = sim->charge.n;
 	weight = mycalloc(n, sizeof(real));
 
-	#ifdef _OPENMP
-	#pragma omp parallel  for \
-		schedule  (static) \
-		default   (none) \
-		shared	(n, charge, rCutCoul2, bjerrumkT, sim) \
-		private   (i, j, p1, p2, dx, dy, dz, E, Efield, Eforce) \
-		reduction (+: coulE, potE)
-	#endif
-
 	for (j=0; j<GPOP; j++) {
 		(pSRD+j)->q=0;
 	}
@@ -488,14 +479,14 @@ void VelocityVerletStep (simptr sim,int MDmode,struct particleMPC *pSRD,struct b
 	kT = sim->kT[sim->phase];
 
 	// update positions and mid-step velocities
+	kinE = kinETherm = 0;
+	v2 = v2max = 0;
 	#ifdef _OPENMP
 	#pragma omp parallel for		 	 \
 			schedule (static)			 \
-			private  (n, p, dx, dy, dz)  \
+			private  (p)                 \
 			shared   (atom, nAtom)
 	#endif
-	kinE = kinETherm = 0;
-	v2 = v2max = 0;
 	for (i=0; i<nAtom; i++) {
 		p = atom+i;
 		// increment velocities
@@ -781,9 +772,8 @@ void ComputeDispersionForces (simptr sim)
 	#ifdef _OPENMP
 	#pragma omp parallel  for \
 		schedule  (static) \
-		default   (none) \
-		shared	  (n, nebrSTD, rCut2, ljShift) \
-		private   (i, p1, p2, dx, dy, dz, E) \
+		default   (shared) \
+		private   (j, p1, p2, dx, dy, dz, E) \
 		reduction (+: ljE, potE)
 	#endif
 	for (i=0; i<n; i++) {
@@ -859,12 +849,10 @@ void ComputeDispersionForcesSRD (simptr sim,particleMPC *pSRD,spec *SP,int GPOP)
 	#ifdef _OPENMP
 	#pragma omp parallel  for \
 		schedule  (static) \
-		default   (none) \
-		shared	  (n, nebrSTD, rCut2, ljShift) \
-		private   (i, p1, p2, dx, dy, dz, E) \
+		default   (shared) \
+		private   (j, p1, p2, dx, dy, dz, E) \
 		reduction (+: ljE, potE)
 	#endif
-
 	for (i=0; i<n; i++) {
 		// Calculate force between all MD-MD particles
 		for (j=0; j<i; j++) {
@@ -951,15 +939,6 @@ void ComputeDispersionForcesSRDCell (simptr sim,int MDmode,struct particleMPC *p
 	groupThermDPD 	= sim->groupThermDPD[sim->phase];
 	box			= sim->box;
 	drTotMax = sim->drTotMax;
-
-	#ifdef _OPENMP
-	#pragma omp parallel  for \
-		schedule  (static) \
-		default   (none) \
-		shared	  (n, nebrSTD, rCut2, ljShift) \
-		private   (i, p1, p2, dx, dy, dz, E) \
-		reduction (+: ljE, potE)
-	#endif
 
 	for( a=0; a<=box[x_]; a++ ) for( b=0; b<=box[y_]; b++ ) for( c=0; c<=box[z_]; c++ ) {
 		// MD-MD bead interactions
@@ -1183,12 +1162,10 @@ void ComputeCapDispersionForces (simptr sim)
 	#ifdef _OPENMP
 	#pragma omp parallel  for \
 		schedule  (static) \
-		default   (none) \
-		shared	  (n, nebrSTD, rCut2, ljShift) \
-		private   (i, p1, p2, dx, dy, dz, E) \
+		default   (shared) \
+		private   (j, p1, p2, dx, dy, dz, E) \
 		reduction (+: r2min, potE)
 	#endif
-
 	for (i=0; i<n; i++) {
 		for (j=0; j<i; j++) {
 			p1 = atom+i;
@@ -1259,12 +1236,10 @@ void ComputeElectrostaticForces (simptr sim)
 	#ifdef _OPENMP
 	#pragma omp parallel  for \
 		schedule  (static) \
-		default   (none) \
-		shared	(n, charge, rCutCoul2, bjerrumkT, sim) \
-		private   (i, j, p1, p2, dx, dy, dz, E, Efield, Eforce) \
+		default   (shared) \
+		private   (j, p1, p2, dx, dy, dz, E, Eforce) \
 		reduction (+: coulE, potE)
 	#endif
-
 	for (i=0; i<n; i++) {
 		// extract first particle pointer
 		p1 = charge[i].p1;
@@ -1318,7 +1293,7 @@ void ComputeAnchorForces (simptr sim)
 	#ifdef _OPENMP
 	#pragma omp parallel  for \
 		schedule  (static) \
-		default   (none) \
+		default   (shared) \
 		shared	(n, anchor) \
 		private   (i, p1, dx, dy, dz, E) \
 		reduction (+: harmE, potE)
